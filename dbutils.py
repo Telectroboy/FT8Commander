@@ -1,29 +1,21 @@
 #
 # BSD 3-Clause License
 #
-# Copyright (c) 2023, Fred W6BSD
+# Copyright (c) 2021-2023, Fred W6BSD
 # All rights reserved.
-#
+# Edited by F4EGM 02/03/2026
 
-import json
 import logging
 import sqlite3
 import time
-from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from threading import Thread
 
-import DXEntity
-
 import geo
+from lookup import DXEntity
 
-
-# DBInsert commands.
-class DBCommand(Enum):
-  INSERT = 1
-  STATUS = 2
-  DELETE = 3
-
+logger = logging.getLogger(__name__)
 
 SQL_TABLE = """
 CREATE TABLE IF NOT EXISTS cqcalls
@@ -52,72 +44,23 @@ CREATE INDEX IF NOT EXISTS idx_grid on cqcalls (grid ASC);
 """
 
 
-logger = logging.getLogger('ft8ctrl.dbutils')
-
-
-def get_band(key):
-  _bands = {
-    1: 160,
-    3: 80,
-    7: 40,
-    10: 30,
-    14: 20,
-    18: 17,
-    21: 15,
-    24: 12,
-    28: 10,
-    50: 6,
-  }
-
-  key = int(key / 10**6)
-  if key not in _bands:
-    return 0
-  return _bands[key]
-
-
-class DBJSONEncoder(json.JSONEncoder):
-  """Special JSON encoder capable of encoding sets"""
-  def default(self, o):
-    if isinstance(o, set):
-      return {'__type__': 'set', 'value': list(o)}
-    if isinstance(o, datetime):
-      return {'__type__': 'datetime', 'value': o.timestamp()}
-
-    return super().default(o)
-
-
-class DBJSONDecoder(json.JSONDecoder):
-  """Special JSON decoder capable of decoding sets encodes by IJSONEncoder"""
-  def __init__(self):
-    super().__init__(object_hook=self.dict_to_object)
-
-  def dict_to_object(self, json_obj):
-    if '__type__' not in json_obj:
-      return json_obj
-    if json_obj['__type__'] == 'set':
-      return set(json_obj['value'])
-    if json_obj['__type__'] == 'datetime':
-      return datetime.fromtimestamp(json_obj['value'])
-
-    return json_obj
-
-
-sqlite3.register_adapter(dict, DBJSONEncoder().encode)
-sqlite3.register_converter('JSON', lambda x: DBJSONDecoder().decode(x.decode('utf-8')))
+class DBCommand(Enum):
+  INSERT = 1
+  STATUS = 2
+  DELETE = 3
 
 
 def connect_db(db_name):
-  try:
-    conn = sqlite3.connect(db_name, timeout=15, detect_types=sqlite3.PARSE_DECLTYPES,
-                           isolation_level=None)
-    conn.row_factory = sqlite3.Row
-  except sqlite3.OperationalError as err:
-    logger.error("Database: %s - %s", db_name, err)
-    raise SystemExit('Database Error') from None
+  conn = sqlite3.connect(db_name, check_same_thread=False)
+  conn.row_factory = sqlite3.Row
   return conn
 
 
 def create_db(db_name):
+  if isinstance(db_name, str):
+    db_name = Path(db_name)
+  if not db_name.parent.exists():
+    db_name.parent.mkdir(parents=True)
   logger.info("Database: %s", db_name)
   with connect_db(db_name) as conn:
     curs = conn.cursor()
@@ -135,9 +78,24 @@ def get_call(db_name, call):
 
 class DBInsert(Thread):
 
+  # Refresh "time" on conflict: critical for delta-window selection.
   INSERT = """
   INSERT INTO cqcalls VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  ON CONFLICT(call, band) DO UPDATE SET snr = excluded.snr, packet = excluded.packet
+  ON CONFLICT(call, band) DO UPDATE SET
+    extra     = excluded.extra,
+    time      = excluded.time,
+    snr       = excluded.snr,
+    grid      = excluded.grid,
+    lat       = excluded.lat,
+    lon       = excluded.lon,
+    distance  = excluded.distance,
+    azimuth   = excluded.azimuth,
+    country   = excluded.country,
+    continent = excluded.continent,
+    cqzone    = excluded.cqzone,
+    ituzone   = excluded.ituzone,
+    frequency = excluded.frequency,
+    packet    = excluded.packet
   WHERE status <> 2
   """
   UPDATE = "UPDATE cqcalls SET status=? WHERE status <> 2 and call = ? and band = ?"
@@ -151,17 +109,25 @@ class DBInsert(Thread):
     self.dxe_lookup = DXEntity.DXCC().lookup
 
   def run(self):
-    # pylint: disable=no-member
     logger.info('Database Insert thread started')
     conn = connect_db(self.db_name)
-    # Run forever and consume the queue
     while True:
       cmd, data = self.queue.get()
+
       if cmd == DBCommand.INSERT:
-        lat, lon = geo.grid2latlon(data['grid'])
-        data['lat'], data['lon'] = lat, lon
-        data['distance'] = geo.distance(self.origin, (lat, lon))
-        data['azimuth'] = geo.azimuth(self.origin, (lat, lon))
+        if data.get('grid'):
+          lat, lon = geo.grid2latlon(data['grid'])
+          data['lat'], data['lon'] = lat, lon
+          data['distance'] = geo.distance(self.origin, (lat, lon))
+          data['azimuth'] = geo.azimuth(self.origin, (lat, lon))
+        else:
+          # Tail-enders / replies may not contain a grid.
+          data['grid'] = None
+          data['lat'] = None
+          data['lon'] = None
+          data['distance'] = None
+          data['azimuth'] = None
+
         try:
           dxentity = self.dxe_lookup(data['call'])
           data['country'] = dxentity.country
@@ -169,8 +135,9 @@ class DBInsert(Thread):
           data['cqzone'] = dxentity.cqzone
           data['ituzone'] = dxentity.ituzone
         except KeyError:
-          logger.error('DXEntity for %s not found, this is probably a fake callsign', data['call'])
+          logger.error('DXEntity for %s not found (fake callsign?)', data['call'])
           continue
+
         try:
           DBInsert.write(conn, data)
         except sqlite3.OperationalError as err:
@@ -178,69 +145,92 @@ class DBInsert(Thread):
         except AttributeError as err:
           logger.error(err)
           logger.error(data)
+
       elif cmd == DBCommand.STATUS:
         try:
-          DBInsert.status(conn, data)
+          conn.execute(self.UPDATE, (data['status'], data['call'], data['band']))
+          conn.commit()
         except sqlite3.OperationalError as err:
           logger.warning("Queue len: %d - Error: %s", self.queue.qsize(), err)
+
       elif cmd == DBCommand.DELETE:
         try:
-          DBInsert.delete(conn, data)
+          conn.execute(self.DELETE, (data['call'], data['band']))
+          conn.commit()
         except sqlite3.OperationalError as err:
           logger.warning("Queue len: %d - Error: %s", self.queue.qsize(), err)
-
-  @staticmethod
-  def write(conn, call_info):
-    # pylint: disable=no-member
-    data = type('CallInfo', (object, ), call_info)
-    with conn:
-      curs = conn.cursor()
-      curs.execute(DBInsert.INSERT, (
-        data.call, data.extra, data.packet['Time'], 0, data.packet['SNR'], data.grid,
-        data.lat, data.lon, data.distance, data.azimuth, data.country, data.continent,
-        data.cqzone, data.ituzone, data.frequency, data.band, data.packet))
-      if not curs.rowcount:
-        logger.debug("DB Write: already worked %s on %d band", data.call, data.band)
       else:
-        logger.debug("DB Write: %s, %s, %s, %s", data.call, data.continent, data.grid,
-                     data.country)
+        logger.error("Unknown command: %s", cmd)
 
   @staticmethod
-  def status(conn, data):
-    with conn:
-      curs = conn.cursor()
-      curs.execute(DBInsert.UPDATE, (data['status'], data['call'], data['band']))
-      logger.debug("%s (%s, %s, %d)", DBInsert.UPDATE, data['status'], data['call'], data['band'])
-
-  @staticmethod
-  def delete(conn, data):
-    with conn:
-      curs = conn.cursor()
-      curs.execute(DBInsert.DELETE, (data['call'], data['band']))
-      logger.debug("%s (%s:%s)", DBInsert.DELETE, data['call'], data['band'])
+  def write(conn, data):
+    req = (
+      data.get('call'),
+      data.get('extra'),
+      data.get('packet', {}).get('Time'),
+      0,
+      data.get('packet', {}).get('SNR'),
+      data.get('grid'),
+      data.get('lat'),
+      data.get('lon'),
+      data.get('distance'),
+      data.get('azimuth'),
+      data.get('country'),
+      data.get('continent'),
+      data.get('cqzone'),
+      data.get('ituzone'),
+      data.get('frequency'),
+      data.get('band'),
+      data.get('packet'),
+    )
+    conn.execute(DBInsert.INSERT, req)
+    conn.commit()
 
 
 class Purge(Thread):
-  REQ = "DELETE FROM cqcalls WHERE status < 2 AND time < datetime('now','{} minute');"
 
-  def __init__(self, db_name, purge_time):
+  PURGE = "DELETE from cqcalls where status <> 2 AND time < ?"
+  INFO = "SELECT COUNT(*) as count FROM cqcalls"
+
+  def __init__(self, db_name, retry_time):
     super().__init__()
     self.db_name = db_name
-    self.purge_time = abs(purge_time) * -1  # make sure we have a negative number
-    self.req = self.REQ.format(self.purge_time)
-    logger.debug(self.req)
+    self.retry_time = retry_time
 
   def run(self):
-    count = 0
-    logger.info('Purge thread started (retry_time %d minutes)', abs(self.purge_time))
+    logger.info('Database purge thread started')
     conn = connect_db(self.db_name)
     while True:
-      with conn:
-        try:
-          curs = conn.cursor()
-          curs.execute(self.req)
-          count = curs.rowcount
-        except sqlite3.OperationalError as err:
-          logger.error(err)
-      logger.debug('Purge %d Records', count)
+      now = time.time() - (self.retry_time * 60)
+      now = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(now))
+      try:
+        conn.execute(self.PURGE, (now,))
+        conn.commit()
+      except sqlite3.OperationalError as err:
+        logger.warning(err)
+      result = conn.execute(self.INFO)
+      logger.debug("Call list %d entries.", result.fetchone()['count'])
       time.sleep(60)
+
+
+def get_band(freq):
+  band = int(round(freq / 1000000))
+  if band > 50:
+    return 6
+  if band == 24:
+    return 12
+  if band == 18:
+    return 17
+  if band == 14:
+    return 20
+  if band == 10:
+    return 30
+  if band == 7:
+    return 40
+  if band == 5:
+    return 60
+  if band == 3:
+    return 80
+  if band == 1:
+    return 160
+  return band
