@@ -4,6 +4,26 @@
 > This is an experimental piece of code. Don't forget to run `git pull` often.
 > This code only works with the version of WSJT-X 2.5 and above.
 
+
+### Modifications par F4EGM
+Résumé des modifications 
+Fichiers modifiés :
+- ft8ctrl.py
+Ajout de la prise en compte des tail-enders : quand une station t’appelle (message REPLY adressé à ton indicatif), elle est désormais ajoutée en base comme candidat appelable (tag extra="TAIL").
+Ajout d’une logique de préemption : si une station t’appelle (tail-ender), le script peut interrompre une tentative en cours sur une autre station afin de prioriser ce QSO à forte probabilité de réussite.
+(Option selon la version que tu as collée) Ajout d’une logique de préemption “CQ DX” : si tu es en train d’insister sur une station locale/EU et qu’un CQ DX apparaît, le script peut stopper la tentative et basculer sur le DX (pour exploiter une ouverture courte).
+- dbutils.py
+Correction de l’UPSERT SQLite : lors d’un ON CONFLICT(call, band), le champ time est maintenant rafraîchi (et pas seulement snr/packet). Sans ça, une station peut rester décodée mais “sortir” de la fenêtre delta et ne plus jamais être sélectionnée.
+Gestion robuste des entrées sans locator (grid=None) pour éviter erreurs et garder les tail-enders exploitables.
+- plugins/special.py
+Ajustement du tri du plugin Extra : pour les entrées extra="TAIL", priorité donnée aux DX transcontinentaux (continent ≠ EU), puis distance (si connue), puis SNR.
+- YAML.example
+
+Fork de https://github.com/0x9900/FT8Commander
+
+
+WORK IN PROGRESS !!!!!!!!!!!!!!!! 02/03/2026
+  
 ### WSJT-X FT8 Automation
 
 FT8Commander is an experimental project for ham radio operators who
