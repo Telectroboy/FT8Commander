@@ -3,6 +3,7 @@
 # BSD 3-Clause License
 #
 # Copyright (c) 2023, Fred W6BSD
+# Modified by F4EGM 02/03/2026
 # All rights reserved.
 #
 
@@ -20,6 +21,7 @@ from pathlib import Path
 from queue import Queue
 
 import wsjtx
+import geo
 from config import Config
 from dbutils import DBCommand, DBInsert, Purge, create_db, get_band
 
@@ -40,6 +42,12 @@ LOGFILE_SIZE = 2 << 20
 LOGFILE_NAME = 'ft8ctrl-debug.log'
 LOG = None
 
+# DX logic: "opening" we must seize.
+# - Consider DX if transcontinental OR very far in km.
+DX_MIN_KM = 3500
+# If we are currently retrying a local/EU and a DX CQ appears, preempt only after at least 1 retry.
+PREEMPT_AFTER_RETRIES = 1
+
 
 class Sequencer:
   # pylint: disable=too-many-instance-attributes
@@ -51,10 +59,12 @@ class Sequencer:
     self.tx_power = getattr(config, 'tx_power')
     self.tx_retries = getattr(config, 'tx_retries', 5)
 
+    self.origin = geo.grid2latlon(config.my_grid)
+
     bind_addr = socket.gethostbyname(config.wsjt_ip)
     self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    self.sock.setblocking(False)  # Set socket to non-blocking mode
+    self.sock.setblocking(False)
     self.sock.bind((bind_addr, config.wsjt_port))
 
     self.logger_ip = getattr(config, 'logger_ip', None)
@@ -62,10 +72,10 @@ class Sequencer:
     self.logger_socket = None
 
   def call_station(self, ip_from, data):
-    LOG.info(('Calling: %s (%s), From: %s, SNR: %d, Distance: %d, Band: %dm '
-             '- %s - https://www.qrz.com/db/%s'),
-             data['call'], data['extra'], data['country'], data['snr'], data['distance'],
-             data['band'], data['selector'], data['call'])
+    LOG.info(('Calling: %s (%s), From: %s, SNR: %d, Distance: %s, Band: %dm '
+             '- %s'),
+             data['call'], data.get('extra'), data.get('country'), data.get('snr'),
+             data.get('distance'), data.get('band'), data.get('selector'))
     pkt = data['packet']
     packet = wsjtx.WSReply()
     packet.call = data['call']
@@ -78,7 +88,6 @@ class Sequencer:
     if self.follow_frequency:
       packet.Modifiers = wsjtx.Modifiers.SHIFT
 
-    LOG.debug('Transmitting %s', packet)
     try:
       self.sock.sendto(packet.raw(), ip_from)
     except IOError as err:
@@ -109,10 +118,7 @@ class Sequencer:
       if name == 'BROKENCQ':
         name = 'CQ'
         data['extra'] = data['grid'] = None
-      elif name == 'CQ':
-        LOG.debug("%s = %r, %s", name, data, message)
       return (name, data)
-    LOG.debug('Unmatched: %s', message)
     return (None, None)
 
   def log_call(self, packet):
@@ -131,8 +137,25 @@ class Sequencer:
       LOG.error('Error: %s - Message: %s', err, packet.Message)
     return (None, None)
 
+  def _cq_distance_km(self, grid):
+    if not grid:
+      return None
+    try:
+      lat, lon = geo.grid2latlon(grid)
+      return geo.distance(self.origin, (lat, lon))
+    except Exception:  # keep it safe; no crash on malformed grids
+      return None
+
+  def _is_dx_cq(self, match):
+    # 1) CQ DX / CQ something DX etc.
+    extra = (match.get('extra') or "").upper()
+    if extra == "DX" or extra.endswith("DX") or extra.startswith("DX"):
+      return True
+    # 2) By distance (if grid present)
+    dist = self._cq_distance_km(match.get('grid'))
+    return (dist is not None and dist >= DX_MIN_KM)
+
   def run(self):
-    # pylint: disable=too-many-locals,too-many-branches,too-many-statements
     ip_from = None
     tx_status = False
     frequency = 0
@@ -147,33 +170,70 @@ class Sequencer:
       for fdin in fds:
         rawdata, ip_from = fdin.recvfrom(1024)
         packet = wsjtx.ft8_decode(rawdata)
+
         match packet:
           case wsjtx.WSHeartbeat() | wsjtx.WSADIF():
             pass
+
           case wsjtx.WSLogged():
             self.log_call(packet)
             current = None
+
           case wsjtx.WSDecode():
             name, match = self.decode(packet)
-            if name == 'REPLY' and match['call'] == current and match['to'] != self.mycall:
-              LOG.info("Stop Transmit: %s Replying to %s ", match['call'], match['to'])
-              self.stop_transmit(ip_from)
-              self.queue.put((DBCommand.DELETE,
-                              {"call": match['call'], "band": get_band(frequency)}))
-            elif name == 'CQ':
+
+            # Tail-enders / replies: if they call us, it's "high success" => priority absolute.
+            if name == 'REPLY':
+              if match['call'] == current and match['to'] != self.mycall:
+                LOG.info("Stop TX: %s replying to %s", match['call'], match['to'])
+                self.stop_transmit(ip_from)
+                self.queue.put((DBCommand.DELETE,
+                                {"call": match['call'], "band": get_band(frequency)}))
+
+              elif match['to'] == self.mycall:
+                # Preempt anything else immediately: they already established mutual copy.
+                if current and match['call'] != current:
+                  LOG.info("Preempt (%s) because tail-ender %s calls us", current, match['call'])
+                  self.stop_transmit(ip_from)
+                  self.queue.put((DBCommand.DELETE,
+                                  {"call": current, "band": get_band(frequency)}))
+                  current = None
+                  current_retries = 0
+                  last_tx_message = ""
+
+                match['extra'] = "TAIL"
+                match['grid'] = None
+                match['frequency'] = frequency
+                match['band'] = get_band(frequency)
+                match['packet'] = packet.as_dict()
+                self.queue.put((DBCommand.INSERT, match))
+
+              continue
+
+            # CQ handling + DX preemption:
+            if name == 'CQ':
+              # If we are insisting on someone (likely local/EU) and a DX CQ appears -> seize opening.
+              if current and current_retries >= PREEMPT_AFTER_RETRIES and self._is_dx_cq(match):
+                LOG.info("Preempt (%s) to chase DX CQ: %s", current, match.get('call'))
+                self.stop_transmit(ip_from)
+                self.queue.put((DBCommand.DELETE,
+                                {"call": current, "band": get_band(frequency)}))
+                current = None
+                current_retries = 0
+                last_tx_message = ""
+
               match['frequency'] = frequency
               match['band'] = get_band(frequency)
               match['packet'] = packet.as_dict()
               self.queue.put((DBCommand.INSERT, match))
-            continue
+              continue
+
           case wsjtx.WSStatus():
-            # WSJT-X will sometimes send multiple status packets where Transmitting is
-            # True for the same transmission.
-            # Checking Decoding here prevents increases in retries for the same transmission.
             tx = not packet.Decoding and packet.Transmitting
+
             if tx and last_tx_message == packet.TxMessage:
               if current_retries >= self.tx_retries:
-                LOG.info("Retries exceeded, stopping transmit")
+                LOG.info("Retries exceeded -> stop TX")
                 self.stop_transmit(ip_from)
                 current_retries = 0
                 continue
@@ -187,18 +247,16 @@ class Sequencer:
             sequence = SEQUENCE_TIME[packet.TXMode]
             frequency = packet.Frequency
             tx_status = any([packet.Transmitting, packet.TXEnabled])
+
             if (packet.Transmitting and packet.DXCall):
               self.queue.put(
                 (DBCommand.STATUS,
                  {"call": packet.DXCall, "status": 1, "band": get_band(frequency)})
               )
-            if packet.DXCall:
-              LOG.debug("%s => TX: %s, TXEnabled: %s - TXWatchdog: %s", packet.DXCall,
-                        packet.Transmitting, packet.TXEnabled, packet.TXWatchdog)
-          case _:
-            LOG.debug('Packet type "%r" not processed', packet)
 
-      # Outside the for loop
+          case _:
+            pass
+
       if not tx_status:
         _now = datetime.utcnow()
         if _now.second in sequence:
@@ -215,7 +273,6 @@ class Sequencer:
 class LoadPlugins:
 
   def __init__(self, plugins):
-    """Load and initialize plugins"""
     self.call_select = []
     if isinstance(plugins, str):
       plugins = [plugins]
@@ -238,14 +295,8 @@ class LoadPlugins:
       if not data:
         continue
       data['selector'] = selector.__class__.__name__
-      LOG.debug('Select: %s, From: %s, SNR: %d, Distance: %dKm, Band: %dm, Selector: %s',
-                data['call'], data['country'], data['snr'], data['distance'],
-                data['band'], data['selector'])
       return data
     return None
-
-  def __repr__(self):
-    return '<LoadPlugins> ' + ', '.join(p.__class__.__name__ for p in self.call_select)
 
 
 def get_log_level():
@@ -257,7 +308,6 @@ def get_log_level():
 
 
 def main():
-  # pylint: disable=global-statement
   global LOG
   parser = ArgumentParser(description="ft8ctl wsjt-x automation")
   parser.add_argument("-c", "--config", help="Name of the configuration file")
@@ -288,13 +338,9 @@ def main():
   create_db(db_name)
 
   queue = Queue()
-  try:
-    db_thread = DBInsert(db_name, queue, config.my_grid)
-    db_thread.daemon = True
-    db_thread.start()
-  except RuntimeError as err:
-    LOG.error("Configuration error: %s", err)
-    raise SystemExit('Configuration Error') from None
+  db_thread = DBInsert(db_name, queue, config.my_grid)
+  db_thread.daemon = True
+  db_thread.start()
 
   db_purge = Purge(db_name, config.retry_time)
   db_purge.daemon = True
