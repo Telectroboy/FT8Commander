@@ -1,103 +1,67 @@
 ---
-#
+# Modified by F4EGM 02/03/2026
 # WSJT-X FT8 Automation
 # /!\ The content of this file is case sensitive
 #
-
+---
 ft8ctrl:
-  my_call: -- CALL_SIGN --
-  my_grid: -- GRID --
+  my_call: "TON_INDICATIF"
+  my_grid: "TON_LOCATOR"
   db_name: ~/ft8ctl.sql
   wsjt_ip: 127.0.0.1
   wsjt_port: 2238
-  follow_frequency: False
-  retry_time: 15                 # In minutes
+
+  follow_frequency: True
   tx_power: 30
-  # tx_retries determines how many times to attempt the same message before stopping transmission
-  tx_retries: 5
-  # Specify which call_selector you want to use, then check the plugin configuration
-  # The selector 'Any' accept any callsigns.
+  tx_retries: 3
+  retry_time: 15
+
+  # Priorité absolue:
+  # 1) Tail-enders (le code préempte déjà tout)
+  # 2) DX transcontinent
+  # 3) EU hors voisins proches
+  # 4) fallback
   call_selector:
+    - Extra
+    - Continent
+    - Country
     - Any
 
-BlackList:
-  - KC5TT
-  - KD7DPS
-  - VA7QI
-  - W5JDC
-  - W6IPA
-
-#
-# Selectors plugins configuration.
-#
-# Use "reverse: True" for "not" in the list
-# All the plugins can use the following options:
-# min_snr, max_snr
-# lotw_users_only # will only work stations that are registered LOTW users.
-
-Any:
-  min_snr: -18
-  max_snr: 3
-  lotw_users_only: True
-
-Grid:
-  regexp: ^[EF][NM].*
-
-CallSign:
+Extra:
+  list: ["TAIL"]
   reverse: False
-  # regexp: ^CO8LY
-  regexp: ^[WKN](\w|)\d\w+
-
-#
-# Use "Reverse: True" for not in the list
-#
-CQZone:
-  reverse: False
-  list:
-    - 14
-    - 11
-    - 8
-    - 4
-    - 9
-
-ITUZone:
-  reverse: True
-  list:
-    - 14
-    - 11
-    - 8
-    - 4
-    - 9
-
-Country:
-  min_snr: -21
-  reverse: True
-  list:
-    - Asiatic Russia
-    - European Russia
-    - Canada
-    - Mexico
-    - United States
+  lotw_users_only: False
+  min_snr: -22
+  max_snr: 10
+  delta: 30
 
 Continent:
-  min_snr: -17
+  my_continent: "EU"
+  list: ["NA", "SA", "AS", "OC", "AF"]
   lotw_users_only: True
-  list:
-    - EU
-    - OC
-    - AS
-
-DXCC100:
-  min_snr: -21
-  worked_count: 4
-  lotw_users_only: False
-
-Extra:
   min_snr: -18
-  min_snr: 1
+  max_snr: 5
+  delta: 24
+
+Country:
+  reverse: True
   list:
-    - POTA
-    - NA
-    - US
-    - USA
-    - QRP
+    - "France"
+    - "Belgium"
+    - "Netherlands"
+    - "Germany"
+    - "Switzerland"
+    - "United Kingdom"
+    - "Italy"
+    - "Spain"
+    - "Luxembourg"
+  lotw_users_only: True
+  min_snr: -18
+  max_snr: 5
+  delta: 24
+
+Any:
+  lotw_users_only: True
+  min_snr: -15
+  max_snr: 8
+  delta: 20
